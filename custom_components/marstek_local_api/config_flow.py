@@ -17,7 +17,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 
 from .api import MarstekAPIError, MarstekUDPClient
-from .const import CONF_PORT, DATA_COORDINATOR, DEFAULT_PORT, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import CONF_PORT, DEFAULT_PORT, DEFAULT_SCAN_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -86,31 +86,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors = {}
 
         if user_input is None:
-            # Perform discovery
-            # Temporarily disconnect existing integration clients to avoid port conflicts
-            paused_clients = []
-            for entry in self._async_current_entries():
-                if DOMAIN in self.hass.data and entry.entry_id in self.hass.data[DOMAIN]:
-                    coordinator = self.hass.data[DOMAIN][entry.entry_id].get(DATA_COORDINATOR)
-                    if coordinator:
-                        # Handle both single-device and multi-device coordinators
-                        if hasattr(coordinator, 'device_coordinators'):
-                            # Multi-device coordinator
-                            _LOGGER.debug("Pausing multi-device coordinator %s during discovery", entry.title)
-                            for device_coordinator in coordinator.device_coordinators.values():
-                                if device_coordinator.api:
-                                    await device_coordinator.api.disconnect()
-                                    paused_clients.append(device_coordinator.api)
-                        elif hasattr(coordinator, 'api') and coordinator.api:
-                            # Single-device coordinator
-                            _LOGGER.debug("Pausing API client for %s during discovery", entry.title)
-                            await coordinator.api.disconnect()
-                            paused_clients.append(coordinator.api)
-
-            # Wait a bit for disconnections to complete and sockets to close
-            import asyncio
-            await asyncio.sleep(1)
-
+            # Perform discovery on the shared UDP port; active entries continue running.
             # Bind to same port as device (required by Marstek protocol)
             api = MarstekUDPClient(self.hass, port=DEFAULT_PORT, remote_port=DEFAULT_PORT)
             try:
@@ -126,17 +102,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 except Exception:
                     pass  # Ignore disconnect errors
                 return await self.async_step_manual()
-            finally:
-                # Wait a bit before resuming to ensure discovery socket is fully closed
-                await asyncio.sleep(1)
-
-                # Resume paused clients
-                for client in paused_clients:
-                    try:
-                        _LOGGER.debug("Resuming paused API client for host %s", client.host)
-                        await client.connect()
-                    except Exception as err:
-                        _LOGGER.warning("Failed to resume client for host %s: %s", client.host, err)
 
             if not self._discovered_devices:
                 # No devices found, offer manual entry
@@ -144,10 +109,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             # Build list of discovered devices
             devices_list = {}
-
-            # Add "All devices" option if multiple devices found
-            if len(self._discovered_devices) > 1:
-                devices_list["__all__"] = f"All devices ({len(self._discovered_devices)} batteries)"
 
             for device in self._discovered_devices:
                 mac = device["mac"]
@@ -175,41 +136,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if selected == "manual":
             return await self.async_step_manual()
-
-        # Check if user selected "All devices"
-        if selected == "__all__":
-            # Create multi-device entry using combined BLE MACs for uniqueness
-            all_ble_macs = sorted(
-                {
-                    d["ble_mac"]
-                    for d in self._discovered_devices
-                    if d.get("ble_mac")
-                }
-            )
-            unique_id = "_".join(all_ble_macs)
-
-            if not unique_id:
-                _LOGGER.debug("No BLE MACs found during multi-device selection; skipping duplicate guard")
-            else:
-                await self.async_set_unique_id(unique_id)
-                self._abort_if_unique_id_configured()
-
-            return self.async_create_entry(
-                title=f"Marstek System ({len(self._discovered_devices)} batteries)",
-                data={
-                    "devices": [
-                        {
-                            CONF_HOST: d["ip"],
-                            CONF_PORT: DEFAULT_PORT,
-                            "wifi_mac": d.get("wifi_mac"),
-                            "ble_mac": d.get("ble_mac"),
-                            "device": d["name"],
-                            "firmware": d["firmware"],
-                        }
-                        for d in self._discovered_devices
-                    ],
-                },
-            )
 
         # Find selected device (single device mode)
         device = next(
@@ -373,36 +299,19 @@ class OptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Entry-point for options flow; present available actions."""
-        actions: dict[str, str] = {
-            "scan_interval": "Adjust update interval",
-        }
-
-        if self._devices:
-            actions.update(
-                {
-                    "rename_device": "Rename a device",
-                    "remove_device": "Remove a device",
-                    "add_device": "Add a device",
-                }
-            )
-
+        """Entry-point for options flow."""
         if user_input is not None:
-            action = user_input["action"]
-            if action == "scan_interval":
-                return await self.async_step_scan_interval()
-            if action == "rename_device":
-                return await self.async_step_rename_device()
-            if action == "remove_device":
-                return await self.async_step_remove_device()
-            if action == "add_device":
-                return await self.async_step_add_device()
+            return await self.async_step_scan_interval()
 
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
                 {
-                    vol.Required("action"): vol.In(actions),
+                    vol.Required("action"): vol.In(
+                        {
+                            "scan_interval": "Adjust update interval",
+                        }
+                    ),
                 }
             ),
         )
@@ -664,25 +573,7 @@ class OptionsFlow(config_entries.OptionsFlow):
 
     async def _async_discover_devices(self) -> None:
         """Discover devices using the same strategy as the config flow."""
-        paused_clients: list[MarstekUDPClient] = []
         self._discovered_devices = []
-
-        if DOMAIN in self.hass.data:
-            for _entry_id, entry_data in self.hass.data[DOMAIN].items():
-                coordinator = entry_data.get(DATA_COORDINATOR)
-                if not coordinator:
-                    continue
-
-                if hasattr(coordinator, "device_coordinators"):
-                    for device_coordinator in coordinator.device_coordinators.values():
-                        if device_coordinator.api:
-                            await device_coordinator.api.disconnect()
-                            paused_clients.append(device_coordinator.api)
-                elif hasattr(coordinator, "api") and coordinator.api:
-                    await coordinator.api.disconnect()
-                    paused_clients.append(coordinator.api)
-
-        await asyncio.sleep(1)
 
         api = MarstekUDPClient(self.hass, port=DEFAULT_PORT, remote_port=DEFAULT_PORT)
         try:
@@ -695,14 +586,6 @@ class OptionsFlow(config_entries.OptionsFlow):
                 await api.disconnect()
             except Exception:  # pylint: disable=broad-except
                 pass
-
-        await asyncio.sleep(1)
-
-        for client in paused_clients:
-            try:
-                await client.connect()
-            except Exception as err:  # pylint: disable=broad-except
-                _LOGGER.warning("Failed to resume client during options flow: %s", err)
 
 
 class CannotConnect(HomeAssistantError):

@@ -226,7 +226,7 @@ class MarstekMultiDeviceCoordinator(DataUpdateCoordinator):
                 coordinator.data = data  # Manually set data since we're calling _async_update_data directly
                 return data
             except Exception as err:
-                _LOGGER.error("Error updating device %s: %s", mac, err)
+                _LOGGER.debug("Error updating device %s: %s", mac, err)
                 return coordinator.data  # Return old data on error
 
         update_tasks = [
@@ -461,7 +461,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                         self._update_device_version(device_info)
                         had_success = True
                 except Exception as err:
-                    _LOGGER.warning("Failed to get device info on first update: %s", err)
+                    _LOGGER.debug("Failed to get device info on first update: %s", err)
 
             # High priority - every update (~60s)
             # ES.GetStatus and Bat.GetStatus for real-time power/energy data
@@ -644,12 +644,12 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             if is_first_update:
                 raise UpdateFailed(f"Error communicating with API: {err}") from err
             # Otherwise log and return preserved data
-            _LOGGER.warning("API error during update, keeping old values: %s", err)
+            _LOGGER.debug("API error during update, keeping old values: %s", err)
             return self.data if self.data else {}
         except Exception as err:
             # Only fail if this is the first update (no existing data to preserve)
             if is_first_update:
                 raise UpdateFailed(f"Unexpected error: {err}") from err
             # Otherwise log and return preserved data
-            _LOGGER.error("Unexpected error during update, keeping old values: %s", err, exc_info=True)
+            _LOGGER.debug("Unexpected error during update, keeping old values: %s", err, exc_info=True)
             return self.data if self.data else {}

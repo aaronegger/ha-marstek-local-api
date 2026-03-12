@@ -656,12 +656,8 @@ class MarstekSensor(CoordinatorEntity, SensorEntity):
         if not self.entity_description.value_fn:
             return None
 
-        # Check if category data is fresh
-        if self.entity_description.category:
-            if not self.coordinator.is_category_fresh(self.entity_description.category):
-                return None  # Stale data - return None instead of old value
-
-        return self.entity_description.value_fn(self.coordinator.data)
+        data = self.coordinator.data or {}
+        return self.entity_description.value_fn(data)
 
     @property
     def available(self) -> bool:
@@ -709,11 +705,6 @@ class MarstekMultiDeviceSensor(CoordinatorEntity, SensorEntity):
         """Return the state of the sensor."""
         if not self.entity_description.value_fn:
             return None
-
-        # Check if category data is fresh
-        if self.entity_description.category:
-            if not self.device_coordinator.is_category_fresh(self.entity_description.category):
-                return None  # Stale data - return None instead of old value
 
         device_data = self.coordinator.get_device_data(self.device_mac)
         return self.entity_description.value_fn(device_data)

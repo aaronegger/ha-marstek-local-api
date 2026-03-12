@@ -31,6 +31,24 @@ cd marstek-local-api
 python3 test/test_tool.py discover
 ```
 
+### Multi-entry Regression Harness
+
+```bash
+cd marstek-local-api
+python3 test/test_multi_entry_registry.py
+```
+
+Validates shared UDP behavior for multiple concurrent config entries, entry unload isolation, and timeout recovery/reconnect.
+
+### Compatibility Scaling Regression
+
+```bash
+cd marstek-local-api
+python3 test/test_compatibility_scaling.py
+```
+
+Validates firmware/hardware scaling for battery temperature and remaining capacity, including the 10x regression fix for HW 3.0 devices.
+
 ### Expected Output
 
 If devices are found:

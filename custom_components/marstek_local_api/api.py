@@ -43,7 +43,8 @@ _LOGGER = logging.getLogger(__name__)
 _shared_transports = {}
 _shared_protocols = {}
 _transport_refcounts = {}
-_clients_by_port = {}  # Map port -> list of clients
+_clients_by_port = {}  # Map port -> set of clients
+_registry_lock = asyncio.Lock()
 
 MessageHandler = Callable[[dict[str, Any], tuple[str, int]], Any]
 
@@ -73,13 +74,23 @@ class MarstekUDPClient:
         self._msg_id_counter = 0  # Counter for integer message IDs
         self._command_lock = asyncio.Lock()
 
-    async def connect(self) -> None:
-        """Connect to the UDP socket."""
-        if self._connected and self.transport:
-            _LOGGER.debug("Already connected on port %s", self.port)
-            return
+    def _is_registration_healthy(self) -> bool:
+        """Return True when this client is attached to the active shared registry."""
+        if not self._connected or self.transport is None:
+            return False
 
-        loop = asyncio.get_event_loop()
+        shared_transport = _shared_transports.get(self.port)
+        clients = _clients_by_port.get(self.port)
+        return (
+            shared_transport is self.transport
+            and clients is not None
+            and self in clients
+        )
+
+    async def connect(self) -> None:
+        """Connect to the shared UDP socket and ensure this client is registered."""
+        if self._is_registration_healthy():
+            return
 
         _LOGGER.info(
             "Connecting UDP socket: local_port=%s, remote_host=%s, remote_port=%s",
@@ -87,48 +98,42 @@ class MarstekUDPClient:
         )
 
         try:
-            # Use shared transport/protocol for this port to ensure all clients
-            # on the same port can receive all UDP messages
-            if self.port not in _shared_transports:
-                # Create shared UDP endpoint for this port
-                endpoint_kwargs = {
-                    "local_addr": ("0.0.0.0", self.port),
-                    "allow_broadcast": True,
-                }
-                # reuse_port is not supported on Windows
-                if sys.platform != "win32":
-                    endpoint_kwargs["reuse_port"] = True
-                transport, protocol = await loop.create_datagram_endpoint(
-                    lambda: MarstekProtocol(),
-                    **endpoint_kwargs,
-                )
-                _shared_transports[self.port] = transport
-                _shared_protocols[self.port] = protocol
-                _transport_refcounts[self.port] = 0
+            async with _registry_lock:
+                loop = asyncio.get_event_loop()
 
+                # Create shared UDP endpoint for this port once.
+                if self.port not in _shared_transports:
+                    endpoint_kwargs = {
+                        "local_addr": ("0.0.0.0", self.port),
+                        "allow_broadcast": True,
+                    }
+                    # reuse_port is not supported on Windows
+                    if sys.platform != "win32":
+                        endpoint_kwargs["reuse_port"] = True
+                    transport, protocol = await loop.create_datagram_endpoint(
+                        lambda: MarstekProtocol(),
+                        **endpoint_kwargs,
+                    )
+                    _shared_transports[self.port] = transport
+                    _shared_protocols[self.port] = protocol
+                    _LOGGER.info("Created shared UDP socket on port %s", self.port)
+
+                clients = _clients_by_port.setdefault(self.port, set())
+                clients.add(self)
+                _transport_refcounts[self.port] = len(clients)
+
+                self.transport = _shared_transports[self.port]
+                self.protocol = _shared_protocols[self.port]
+                self._connected = True
+
+                sock = self.transport.get_extra_info("socket")
                 _LOGGER.info(
-                    "Created shared UDP socket on port %s",
-                    self.port
+                    "UDP socket connected: local_port=%s, socket=%s, refcount=%d, clients=%d",
+                    self.port,
+                    sock.getsockname() if sock else "unknown",
+                    _transport_refcounts[self.port],
+                    len(clients),
                 )
-
-            # Use the shared transport/protocol
-            self.transport = _shared_transports[self.port]
-            self.protocol = _shared_protocols[self.port]
-            _transport_refcounts[self.port] += 1
-
-            # Register this client for message dispatching
-            if self.port not in _clients_by_port:
-                _clients_by_port[self.port] = []
-            if self not in _clients_by_port[self.port]:
-                _clients_by_port[self.port].append(self)
-
-            self._connected = True
-            sock = self.transport.get_extra_info('socket')
-            _LOGGER.info(
-                "UDP socket connected: local_port=%s, socket=%s, refcount=%d, clients=%d",
-                self.port, sock.getsockname() if sock else "unknown",
-                _transport_refcounts[self.port], len(_clients_by_port[self.port])
-            )
         except Exception as err:
             _LOGGER.error(
                 "Failed to connect UDP socket on port %s: %s",
@@ -137,43 +142,50 @@ class MarstekUDPClient:
             raise
 
     async def disconnect(self) -> None:
-        """Disconnect from the UDP socket."""
-        if not self._connected:
-            return
+        """Disconnect this client from the shared UDP socket."""
+        async with _registry_lock:
+            clients = _clients_by_port.get(self.port)
+            if clients is not None:
+                clients.discard(self)
+                _transport_refcounts[self.port] = len(clients)
 
-        if self.port in _transport_refcounts:
-            # Unregister this client from message dispatching
-            if self.port in _clients_by_port and self in _clients_by_port[self.port]:
-                _clients_by_port[self.port].remove(self)
+                # Only close the shared transport when the last client disconnects.
+                if not clients:
+                    transport = _shared_transports.pop(self.port, None)
+                    _shared_protocols.pop(self.port, None)
+                    _transport_refcounts.pop(self.port, None)
+                    _clients_by_port.pop(self.port, None)
+                    if transport:
+                        try:
+                            transport.close()
+                        except Exception as err:
+                            _LOGGER.warning("Error closing transport: %s", err)
+                    _LOGGER.debug("Closed shared UDP socket on port %s", self.port)
+                else:
+                    _LOGGER.debug(
+                        "UDP socket disconnected, %d clients still connected on port %s",
+                        len(clients),
+                        self.port,
+                    )
 
-            _transport_refcounts[self.port] -= 1
+            self.transport = None
+            self.protocol = None
+            self._connected = False
 
-            # Only close the shared transport when last client disconnects
-            if _transport_refcounts[self.port] <= 0:
-                if self.transport:
-                    try:
-                        self.transport.close()
-                    except Exception as err:
-                        _LOGGER.warning("Error closing transport: %s", err)
-
-                if self.port in _shared_transports:
-                    del _shared_transports[self.port]
-                if self.port in _shared_protocols:
-                    del _shared_protocols[self.port]
-                if self.port in _transport_refcounts:
-                    del _transport_refcounts[self.port]
-                if self.port in _clients_by_port:
-                    del _clients_by_port[self.port]
-                _LOGGER.debug("Closed shared UDP socket on port %s", self.port)
-            else:
-                _LOGGER.debug(
-                    "UDP socket disconnected, %d clients still connected on port %s",
-                    _transport_refcounts[self.port], self.port
-                )
-
-        self.transport = None
-        self.protocol = None
-        self._connected = False
+    async def _recover_from_timeout(self, method: str, attempt: int, attempt_limit: int) -> None:
+        """Reconnect after timeout so this client gets re-registered if registry state drifted."""
+        _LOGGER.debug(
+            "Reconnecting UDP client after timeout for %s (attempt %d/%d, host=%s)",
+            method,
+            attempt,
+            attempt_limit,
+            self.host,
+        )
+        try:
+            await self.disconnect()
+            await self.connect()
+        except Exception as err:  # pragma: no cover - recovery best effort
+            _LOGGER.warning("Failed to recover UDP client after timeout: %s", err)
 
     def register_handler(self, handler) -> None:
         """Register a message handler."""
@@ -224,7 +236,7 @@ class MarstekUDPClient:
     ) -> dict | None:
         """Send a command and wait for response."""
         async with self._command_lock:
-            if not self._connected:
+            if not self._is_registration_healthy():
                 await self.connect()
 
             if params is None:
@@ -351,7 +363,7 @@ class MarstekUDPClient:
                             timeout=True,
                             error="timeout",
                         )
-                        _LOGGER.warning(
+                        _LOGGER.debug(
                             "Command %s timed out after %ss (attempt %d/%d, host=%s)",
                             method,
                             effective_timeout,
@@ -360,6 +372,12 @@ class MarstekUDPClient:
                             self.host,
                         )
                         last_exception = None
+                        if attempt < attempt_limit:
+                            await self._recover_from_timeout(
+                                method,
+                                attempt,
+                                attempt_limit,
+                            )
                     except MarstekAPIError:
                         # Error already recorded in the if "error" block above
                         raise
@@ -372,7 +390,7 @@ class MarstekUDPClient:
                             timeout=False,
                             error=str(err),
                         )
-                        _LOGGER.error(
+                        _LOGGER.debug(
                             "Error sending command %s to %s on attempt %d/%d: %s",
                             method,
                             self.host,
@@ -400,7 +418,7 @@ class MarstekUDPClient:
             if last_exception:
                 raise last_exception
 
-            _LOGGER.error(
+            _LOGGER.debug(
                 "Command %s failed after %d attempt(s); returning no result",
                 method,
                 attempt_limit,
@@ -859,7 +877,7 @@ class MarstekProtocol(asyncio.DatagramProtocol):
 
         # Dispatch to relevant clients on this port
         if self.port and self.port in _clients_by_port:
-            for client in _clients_by_port[self.port]:
+            for client in tuple(_clients_by_port[self.port]):
                 if client.host is None or client.host == addr[0]:
                     asyncio.create_task(client._handle_message(data, addr))
         else:

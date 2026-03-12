@@ -14,7 +14,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
-from .coordinator import MarstekDataUpdateCoordinator, MarstekMultiDeviceCoordinator
+from .coordinator import MarstekDataUpdateCoordinator
 from .services import async_setup_services, async_unload_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -29,59 +29,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Get scan interval from options (Design Doc §297-302)
     scan_interval = entry.options.get("scan_interval", DEFAULT_SCAN_INTERVAL)
 
-    # Check if this is a multi-device or single-device entry
+    # Legacy multi-device entries are no longer supported.
     if "devices" in entry.data:
-        # Multi-device mode
-        _LOGGER.info("Setting up multi-device entry with %d devices", len(entry.data["devices"]))
-
-        # Create multi-device coordinator
-        coordinator = MarstekMultiDeviceCoordinator(
-            hass,
-            devices=entry.data["devices"],
-            scan_interval=scan_interval,
-            config_entry=entry,
+        _LOGGER.error(
+            "Entry %s uses legacy multi-device configuration, which is no longer supported. "
+            "Remove this entry and add each battery as its own Marstek Local API entry.",
+            entry.entry_id,
         )
+        return False
 
-        # Set up device coordinators
-        await coordinator.async_setup()
+    _LOGGER.info("Setting up single-device entry")
 
-        # Fetch initial data
-        await coordinator.async_config_entry_first_refresh()
+    # Create API client
+    # Bind to same port as device (required by Marstek protocol)
+    # Use reuse_port to allow multiple instances
+    api = MarstekUDPClient(
+        hass,
+        host=entry.data[CONF_HOST],
+        port=entry.data[CONF_PORT],  # Bind to device port (with reuse_port)
+        remote_port=entry.data[CONF_PORT],  # Send to device port
+    )
 
-    else:
-        # Single device mode (legacy/backwards compatibility)
-        _LOGGER.info("Setting up single-device entry")
+    # Connect to device
+    try:
+        await api.connect()
+    except Exception as err:
+        _LOGGER.error("Failed to connect to Marstek device: %s", err)
+        return False
 
-        # Create API client
-        # Bind to same port as device (required by Marstek protocol)
-        # Use reuse_port to allow multiple instances
-        api = MarstekUDPClient(
-            hass,
-            host=entry.data[CONF_HOST],
-            port=entry.data[CONF_PORT],  # Bind to device port (with reuse_port)
-            remote_port=entry.data[CONF_PORT],  # Send to device port
-        )
+    # Create coordinator
+    coordinator = MarstekDataUpdateCoordinator(
+        hass,
+        api,
+        device_name=entry.data.get("device", "Marstek Device"),
+        firmware_version=entry.data.get("firmware", 0),
+        device_model=entry.data.get("device", ""),
+        scan_interval=scan_interval,
+        config_entry=entry,
+    )
 
-        # Connect to device
-        try:
-            await api.connect()
-        except Exception as err:
-            _LOGGER.error("Failed to connect to Marstek device: %s", err)
-            return False
-
-        # Create coordinator
-        coordinator = MarstekDataUpdateCoordinator(
-            hass,
-            api,
-            device_name=entry.data.get("device", "Marstek Device"),
-            firmware_version=entry.data.get("firmware", 0),
-            device_model=entry.data.get("device", ""),
-            scan_interval=scan_interval,
-            config_entry=entry,
-        )
-
-        # Fetch initial data
-        await coordinator.async_config_entry_first_refresh()
+    # Fetch initial data
+    await coordinator.async_config_entry_first_refresh()
 
     # Store coordinator
     hass.data[DOMAIN][entry.entry_id] = {
@@ -111,21 +99,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unload_ok:
-        # Disconnect API(s)
-        coordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
-
-        if isinstance(coordinator, MarstekMultiDeviceCoordinator):
-            # Disconnect all device APIs
-            for device_coordinator in coordinator.device_coordinators.values():
-                await device_coordinator.api.disconnect()
-        else:
-            # Single device coordinator
+        entry_payload = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        coordinator = entry_payload.get(DATA_COORDINATOR) if entry_payload else None
+        if coordinator and hasattr(coordinator, "api"):
             await coordinator.api.disconnect()
 
         # Remove entry from domain data
-        hass.data[DOMAIN].pop(entry.entry_id)
+        if DOMAIN in hass.data:
+            hass.data[DOMAIN].pop(entry.entry_id, None)
 
-        if not hass.data[DOMAIN]:
+        if DOMAIN in hass.data and not hass.data[DOMAIN]:
             await async_unload_services(hass)
 
     return unload_ok
